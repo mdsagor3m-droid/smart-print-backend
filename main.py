@@ -18,49 +18,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def clean_and_enhance_nid(img_bytes):
+def process_nid_image(img_bytes):
+    # Read image bytes using OpenCV
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if img is None:
         return Image.open(io.BytesIO(img_bytes)).convert('RGB')
 
-    # Safe Bounding Box Cropping (কোনো গ্লিচ বা বাঁকা distortion হবে না)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(c)
-        # যদি সাইজ ঠিক থাকে তবেই ক্রপ করবে, নতুবা পুরো ছবি রাখবে
-        if w > 200 and h > 100:
-            # একটু মার্জিন রেখে ক্রপ করা যাতে কার্ডের বর্ডার কেটে না যায়
-            pad = 10
-            h_img, w_img, _ = img.shape
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(w_img, x + w + pad)
-            y2 = min(h_img, y + h + pad)
-            img = img[y1:y2, x1:x2]
+    # Convert to RGB for PIL processing
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
 
-    # Professional Scan Clean (ব্যাকগ্রাউন্ড উজ্জ্বল এবং লেখা স্পষ্ট করা)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    # Clean lighting, boost contrast and remove dull background noise to look like a scanned doc
+    enhancer_contrast = ImageEnhance.Contrast(pil_img)
+    pil_img = enhancer_contrast.enhance(1.3)
 
-    enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(enhanced_rgb)
-
-    # Contrast & Sharpness Boost
-    enhancer = ImageEnhance.Contrast(pil_img)
-    pil_img = enhancer.enhance(1.25)
     enhancer_sharp = ImageEnhance.Sharpness(pil_img)
     pil_img = enhancer_sharp.enhance(1.4)
+
+    enhancer_bright = ImageEnhance.Brightness(pil_img)
+    pil_img = enhancer_bright.enhance(1.1)
 
     return pil_img
 
@@ -95,17 +73,19 @@ async def fix_nid(front_file: UploadFile = File(...), back_file: UploadFile = Fi
     CARD_W, CARD_H = 1011, 637  # Standard NID physical size (85.6mm x 53.9mm @ 300 DPI)
     A4_W, A4_H = 2480, 3508
     
+    # Process Front Image
     front_bytes = await front_file.read()
-    front_img = clean_and_enhance_nid(front_bytes)
+    front_img = process_nid_image(front_bytes)
     front_resized = front_img.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
     
+    # Create pure white A4 canvas
     a4_canvas = Image.new('RGB', (A4_W, A4_H), color='white')
     margin_left = (A4_W - CARD_W) // 2
     gap = 140
 
     if back_file:
         back_bytes = await back_file.read()
-        back_img = clean_and_enhance_nid(back_bytes)
+        back_img = process_nid_image(back_bytes)
         back_resized = back_img.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
         
         total_content_h = (CARD_H * 2) + gap
