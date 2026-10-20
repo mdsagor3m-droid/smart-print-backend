@@ -50,7 +50,7 @@ def four_point_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def auto_clean_nid(img_bytes):
+def clean_and_enhance_nid(img_bytes):
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
@@ -59,54 +59,61 @@ def auto_clean_nid(img_bytes):
 
     orig = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Canny Edge Detection
-    edged = cv2.Canny(blurred, 50, 200)
+    # Bilateral filter to smooth background while keeping text sharp
+    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
     
-    # Find contours for card detection
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    # Thresholding for finding card boundaries
+    thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     card_cnt = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            card_cnt = approx
-            break
+    if contours:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4:
+                card_cnt = approx
+                break
 
     if card_cnt is not None:
         warped = four_point_transform(orig, card_cnt.reshape(4, 2))
     else:
-        # Fallback to bounding box crop if 4 points contour fails
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours_tb, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours_tb:
-            c = max(contours_tb, key=cv2.contourArea)
+        # Fallback bounding rect crop
+        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh_otsu = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(thresh_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
             x, y, w, h = cv2.boundingRect(c)
-            if w > 100 and h > 100:
+            if w > 150 and h > 100:
                 warped = orig[y:y+h, x:x+w]
             else:
                 warped = orig
         else:
             warped = orig
 
-    # Color Adjustments (Remove shadow & increase sharpness)
+    # Color & Light Enhancement (Scan-quality effect)
     lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    
+    # Normalizing lightness channel to remove shadows
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     cl = clahe.apply(l)
+    
     limg = cv2.merge((cl, a, b))
     enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
     enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(enhanced_rgb)
 
-    # Sharpness & Contrast boost
+    # Sharpness & Contrast Adjustment
     enhancer = ImageEnhance.Contrast(pil_img)
-    pil_img = enhancer.enhance(1.25)
-    
+    pil_img = enhancer.enhance(1.3)
+    enhancer_sharp = ImageEnhance.Sharpness(pil_img)
+    pil_img = enhancer_sharp.enhance(1.5)
+
     return pil_img
 
 @app.get("/")
@@ -137,11 +144,11 @@ async def resize_image(file: UploadFile = File(...), preset: str = Form(...)):
 
 @app.post("/api/nid-fix")
 async def fix_nid(front_file: UploadFile = File(...), back_file: UploadFile = File(None)):
-    CARD_W, CARD_H = 1011, 637  # Standard physical NID size (85.6mm x 53.9mm @ 300 DPI)
+    CARD_W, CARD_H = 1011, 637  # Standard NID physical size (85.6mm x 53.9mm @ 300 DPI)
     A4_W, A4_H = 2480, 3508
     
     front_bytes = await front_file.read()
-    front_img = auto_clean_nid(front_bytes)
+    front_img = clean_and_enhance_nid(front_bytes)
     front_resized = front_img.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
     
     a4_canvas = Image.new('RGB', (A4_W, A4_H), color='white')
@@ -150,7 +157,7 @@ async def fix_nid(front_file: UploadFile = File(...), back_file: UploadFile = Fi
 
     if back_file:
         back_bytes = await back_file.read()
-        back_img = auto_clean_nid(back_bytes)
+        back_img = clean_and_enhance_nid(back_bytes)
         back_resized = back_img.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
         
         total_content_h = (CARD_H * 2) + gap
